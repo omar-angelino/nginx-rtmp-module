@@ -771,6 +771,7 @@ ngx_rtmp_codec_meta_data(ngx_rtmp_session_t *s, ngx_rtmp_header_t *h,
         double                      duration;
         double                      frame_rate;
         double                      video_data_rate;
+        double                      video_keyframe_frequency;
         double                      video_codec_id_n;
         u_char                      video_codec_id_s[32];
         double                      audio_data_rate;
