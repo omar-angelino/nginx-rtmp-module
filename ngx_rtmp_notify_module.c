@@ -714,7 +714,7 @@ ngx_rtmp_notify_update_create(ngx_rtmp_session_t *s, void *arg,
                             sizeof("&call=update") + sfx.len +
                                 sizeof("&time=") + NGX_TIME_T_LEN +
                                 sizeof("&timestamp=") + NGX_INT32_LEN +
-                                sizeof("&bytes_received=") + NGX_INT32_LEN +
+                                sizeof("&bytes_received=") + sizeof(0xf0000000) +
                                 sizeof("&name=") + name_len * 3 +
                                 1 + args_len);
     if (b == NULL)
