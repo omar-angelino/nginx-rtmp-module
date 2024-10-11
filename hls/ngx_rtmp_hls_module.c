@@ -30,8 +30,12 @@ static ngx_int_t ngx_rtmp_hls_ensure_directory(ngx_rtmp_session_t *s,
        ngx_str_t *path);
 
 
-#define NGX_RTMP_HLS_BUFSIZE            (1024*1024)
-#define NGX_RTMP_HLS_DIR_ACCESS         0744
+/* Big buffer for 8k (QHD) cameras */
+#ifndef NGX_RTMP_HLS_BUFSIZE
+#define NGX_RTMP_HLS_BUFSIZE            (16*1024*1024)
+#endif
+/* Allow access to www-data (web-server) and others too */
+#define NGX_RTMP_HLS_DIR_ACCESS         0755
 
 
 typedef struct {
@@ -39,8 +43,8 @@ typedef struct {
     uint64_t                            key_id;
     ngx_str_t                          *datetime;
     double                              duration;
-    unsigned                            active:1;
-    unsigned                            discont:1; /* before */
+    u_char                              active;     /* small int, 0/1 */
+    u_char                              discont;    /* small int, 0/1 */
 } ngx_rtmp_hls_frag_t;
 
 
@@ -51,7 +55,7 @@ typedef struct {
 
 
 typedef struct {
-    unsigned                            opened:1;
+    u_char                              opened;     /* small int, 0/1 */
 
     ngx_rtmp_mpegts_file_t              file;
 
@@ -69,6 +73,7 @@ typedef struct {
     uint64_t                            key_id;
     ngx_uint_t                          nfrags;
     ngx_rtmp_hls_frag_t                *frags; /* circular 2 * winfrags + 1 */
+    uint64_t                            mediaseq;
 
     ngx_uint_t                          audio_cc;
     ngx_uint_t                          video_cc;
@@ -525,7 +530,7 @@ ngx_rtmp_hls_write_variant_playlist(ngx_rtmp_session_t *s)
 
 
 static ngx_int_t
-ngx_rtmp_hls_write_playlist(ngx_rtmp_session_t *s)
+ngx_rtmp_hls_write_playlist(ngx_rtmp_session_t *s, int final)
 {
     static u_char                   buffer[1024];
     ngx_fd_t                        fd;
@@ -534,7 +539,9 @@ ngx_rtmp_hls_write_playlist(ngx_rtmp_session_t *s)
     ssize_t                         n;
     ngx_rtmp_hls_app_conf_t        *hacf;
     ngx_rtmp_hls_frag_t            *f;
-    ngx_uint_t                      i, max_frag;
+    ngx_int_t                      i, start_i;
+    ngx_uint_t                      max_frag;
+    double                          fragments_length;
     ngx_str_t                       name_part, key_name_part;
     uint64_t                        prev_key_id;
     const char                     *sep, *key_sep;
@@ -556,7 +563,32 @@ ngx_rtmp_hls_write_playlist(ngx_rtmp_session_t *s)
 
     max_frag = hacf->fraglen / 1000;
 
-    for (i = 0; i < ctx->nfrags; i++) {
+    /**
+     * Need to check fragments length sum and playlist max length
+     * Do backward search
+     */
+    start_i = 0;
+    fragments_length = 0.;
+    for (i = ctx->nfrags-1; i >= 0; i--) {
+        f = ngx_rtmp_hls_get_frag(s, i);
+        if (f->duration) {
+            fragments_length += f->duration;
+        }
+        /**
+         * Think that sum of frag length is more than playlist desired length - half minimal frag length
+         * XXX: sometimes sum of frag lengths are almost playlist length
+         *      but key-frames come at random rate...
+         */
+        if (fragments_length >= hacf->playlen/1000. - max_frag/2) {
+            start_i = i;
+            break;
+        }
+    }
+
+    ngx_log_debug1(NGX_LOG_DEBUG_RTMP, s->connection->log, 0,
+                   "hls: found starting fragment=%i", start_i);
+
+    for (i = start_i; i < (ngx_int_t)ctx->nfrags; i++) {
         f = ngx_rtmp_hls_get_frag(s, i);
         if (f->duration > max_frag) {
             max_frag = (ngx_uint_t) (f->duration + .5);
@@ -571,7 +603,7 @@ ngx_rtmp_hls_write_playlist(ngx_rtmp_session_t *s)
                      "#EXT-X-VERSION:3\n"
                      "#EXT-X-MEDIA-SEQUENCE:%uL\n"
                      "#EXT-X-TARGETDURATION:%ui\n",
-                     ctx->frag, max_frag);
+                     ctx->mediaseq++, max_frag);
 
     if (hacf->type == NGX_RTMP_HLS_TYPE_EVENT) {
         p = ngx_slprintf(p, end, "#EXT-X-PLAYLIST-TYPE:EVENT\n");
@@ -603,9 +635,9 @@ ngx_rtmp_hls_write_playlist(ngx_rtmp_session_t *s)
 
     prev_key_id = 0;
 
-    for (i = 0; i < ctx->nfrags; i++) {
+    for (i = start_i; i < (ngx_int_t)ctx->nfrags; i++) {
         f = ngx_rtmp_hls_get_frag(s, i);
-        if ((i == 0 || f->discont) && f->datetime && f->datetime->len > 0) {
+        if ((i == start_i || f->discont) && f->datetime && f->datetime->len > 0) {
             p = ngx_snprintf(buffer, sizeof(buffer), "#EXT-X-PROGRAM-DATE-TIME:");
             n = ngx_write_fd(fd, buffer, p - buffer);
             if (n < 0) {
@@ -645,8 +677,17 @@ ngx_rtmp_hls_write_playlist(ngx_rtmp_session_t *s)
         ngx_log_debug5(NGX_LOG_DEBUG_RTMP, s->connection->log, 0,
                        "hls: fragment frag=%uL, n=%ui/%ui, duration=%.3f, "
                        "discont=%i",
-                       ctx->frag, i + 1, ctx->nfrags, f->duration, f->discont);
+                       ctx->frag, i + 1, ctx->nfrags, f->duration, (ngx_int_t)f->discont);
 
+        n = ngx_write_fd(fd, buffer, p - buffer);
+        if (n < 0) {
+            goto write_err;
+        }
+    }
+
+    if (final)
+    {
+        p = ngx_slprintf(p, end, "#EXT-X-ENDLIST\n");
         n = ngx_write_fd(fd, buffer, p - buffer);
         if (n < 0) {
             goto write_err;
@@ -933,7 +974,7 @@ ngx_rtmp_hls_get_fragment_datetime(ngx_rtmp_session_t *s, uint64_t ts)
 
 
 static ngx_int_t
-ngx_rtmp_hls_close_fragment(ngx_rtmp_session_t *s)
+ngx_rtmp_hls_close_final_fragment(ngx_rtmp_session_t *s, int final)
 {
     ngx_rtmp_hls_ctx_t         *ctx;
 
@@ -951,9 +992,16 @@ ngx_rtmp_hls_close_fragment(ngx_rtmp_session_t *s)
 
     ngx_rtmp_hls_next_frag(s);
 
-    ngx_rtmp_hls_write_playlist(s);
+    ngx_rtmp_hls_write_playlist(s, final);
 
     return NGX_OK;
+}
+
+
+static ngx_int_t
+ngx_rtmp_hls_close_fragment(ngx_rtmp_session_t *s)
+{
+    return ngx_rtmp_hls_close_final_fragment(s, 0);
 }
 
 
@@ -1617,7 +1665,7 @@ ngx_rtmp_hls_close_stream(ngx_rtmp_session_t *s, ngx_rtmp_close_stream_t *v)
     ngx_log_debug0(NGX_LOG_DEBUG_RTMP, s->connection->log, 0,
                    "hls: close stream");
 
-    ngx_rtmp_hls_close_fragment(s);
+    ngx_rtmp_hls_close_final_fragment(s, 1);
 
 next:
     return next_close_stream(s, v);
