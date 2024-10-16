@@ -651,8 +651,8 @@ ngx_rtmp_codec_parse_hevc_header(ngx_rtmp_session_t *s, ngx_chain_t *in)
 {
     ngx_rtmp_codec_ctx_t   *ctx;
     ngx_rtmp_bit_reader_t   br;
-    ngx_uint_t              num_arrays, nal_unit_type, num_nalus;
-    ngx_uint_t              i, j, width, height;
+    // ngx_uint_t              num_arrays, nal_unit_type, num_nalus;
+    // ngx_uint_t              i, j, width, height;
 
     ngx_log_debug0(NGX_LOG_DEBUG_RTMP, s->connection->log, 0,
                    "codec: parsing HEVC header");
